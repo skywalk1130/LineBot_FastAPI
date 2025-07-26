@@ -1,0 +1,20 @@
+your_project_name/
+├── main.py
+├── config.py
+├── requirements.txt
+├── .env
+├── Dockerfile
+├── deploy.sh
+
+├── routers/
+│   ├── line_webhook.py
+│   └── commands.py
+
+├── services/
+│   ├── line_message_handler.py
+│   ├── user_state_manager.py
+│   └── email_sender.py
+
+├── utils/
+│   ├── gsheet_connector.py
+│   └── line_api_client.py
