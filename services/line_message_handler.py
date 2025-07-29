@@ -1,158 +1,113 @@
-import asyncio
 import logging
-from functools import wraps
-import datetime
+from datetime import datetime, timezone, timedelta
+
+from linebot.v3.exceptions import LineBotApiError
 from linebot.v3.messaging import (
+    MessageEvent,
     MessagingApi,
     ReplyMessageRequest,
-    TextMessage as V3TextMessage,
+    TextMessage,
+    TextMessageContent,
 )
-from linebot.v3.webhooks import MessageEvent
-from utils.gsheet_connector import GSheetConnector
-from services.email_sender import send_notification_email
-from config import settings
 
-logger = logging.getLogger("linebot_logger")
-# 初始化 Google Sheet 連接器
-gsheet_connector = GSheetConnector()
+# 假設這些自訂模組存在於您的專案結構中
+from services.async_email_sender import send_notification_email
+from utils.async_gsheet_connector import AsyncGSheetConnector, GSheetApiClientError
 
-def command_with_argument(usage_message: str):
-    """
-    A decorator to handle boilerplate for commands that require one argument.
-    It handles argument parsing, validation, and centralized error handling.
-    """
-    def decorator(func):
-        @wraps(func)
-        async def wrapper(event: MessageEvent, messaging_api: MessagingApi):
-            command_name = func.__name__
-            argument = None
-            try:
-                parts = event.message.text.split(maxsplit=1)
-                if len(parts) < 2:
-                    await messaging_api.reply_message(ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[V3TextMessage(text=usage_message)]
-                    ))
-                    return
-                
-                argument = parts[1]
-                await func(argument, event, messaging_api) # Pass the argument to the actual command
-            except Exception as e:
-                logger.error(f"Error in command '{command_name}' with argument '{argument}': {e}", exc_info=True)
-                await messaging_api.reply_message(ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[V3TextMessage(text="指令執行失敗，請稍後再試。")]
-                ))
-        return wrapper
-    return decorator
+# --- 設定 ---
+logger = logging.getLogger(__name__)
+gsheet_connector = AsyncGSheetConnector()
+TAIWAN_TZ = timezone(timedelta(hours=+8))  # 設定時區為台灣時間
 
-async def handle_message(event: MessageEvent, messaging_api: MessagingApi):
-    text = event.message.text # 確保事件是 TextMessageContent
 
-    # 檢查是否來自群組或聊天室，如果是，則拒絕服務並回覆
-    if event.source.type != "user":
-        await messaging_api.reply_message(ReplyMessageRequest(
-            reply_token=event.reply_token,
-            messages=[V3TextMessage(text="抱歉，本機器人僅支援一對一聊天。")]
-        ))
+async def _reply_with_error(messaging_api: MessagingApi, event: MessageEvent, text: str):
+    """一個輔助函式，用於發送錯誤回覆並記錄失敗。"""
+    try:
+        await messaging_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=text)]
+            )
+        )
+    except LineBotApiError as e:
+        # 如果連回覆錯誤訊息都失敗，只能記錄下來
+        logger.error(
+            f"無法發送錯誤訊息給使用者 {event.source.user_id}: {e.status_code} {e.error.message}"
+        )
+
+async def handle_register_command(event: MessageEvent, messaging_api: MessagingApi):
+    """處理使用者的登記邏輯。"""
+    user_id = event.source.user_id
+    if not user_id:
+        logger.warning("收到一個沒有 user_id 的訊息事件。")
         return
 
-    # 使用字典進行指令分派
-    command_handlers = {
-        "/登記": register_command,
-        "/查詢": query_command,
-        "/取消": cancel_command, # 使用 startswith 進行模糊匹配
-    }
-
-    # 找到對應的處理函式
-    handler = command_handlers.get(text.split()[0]) # 取第一個詞作為指令
-    if handler:
-        await handler(event, messaging_api)
-    else:
-        # 處理一般訊息
-        await default_message_handler(event, messaging_api)
-
-async def register_command(event: MessageEvent, messaging_api: MessagingApi):
-    # 處理登記邏輯
     try:
-        # 執行阻塞 I/O 操作於獨立線程
-        new_serial = await asyncio.to_thread(gsheet_connector.get_new_serial)
-        
-        # 使用更精確的伺服器時間，並格式化
-        timestamp_dt = datetime.datetime.fromtimestamp(event.timestamp / 1000)
-        timestamp_str = timestamp_dt.strftime('%Y-%m-%d %H:%M:%S')
+        user_name = "使用者"  # 設定預設名稱
+        # 1. 取得使用者個人資料以獲取顯示名稱
+        try:
+            profile = await messaging_api.get_profile(user_id)
+            user_name = profile.display_name
+        except LineBotApiError as e:
+            # 如果個人資料獲取失敗，僅記錄錯誤但繼續執行，使用預設名稱
+            logger.warning(f"無法取得使用者 {user_id} 的個人資料: {e.status_code} {e.error.message}. 將使用預設名稱。")
 
-        # 因為只處理一對一聊天，直接獲取用戶個人資料即可
-        profile = await messaging_api.get_profile(event.source.user_id)
-        user_name = profile.display_name
+        # 2. 核心邏輯：非同步與 Google Sheets 互動
+        logger.info(f"開始為使用者進行登記: {user_name} ({user_id})")
+        new_serial = await gsheet_connector.get_new_serial()
+        timestamp_str = datetime.now(TAIWAN_TZ).strftime("%Y-%m-%d %H:%M:%S")
+        row_data = [new_serial, user_id, user_name, timestamp_str]
+        await gsheet_connector.append_row(row_data)
+        logger.info(f"已成功將資料寫入 GSheet，序號為 {new_serial}")
 
-        row_data = [
-            str(new_serial),
-            timestamp_str,
-            user_name,
-            event.source.user_id,
-            "待處理"
-        ]
-        # 執行阻塞 I/O 操作於獨立線程
-        await asyncio.to_thread(gsheet_connector.append_row, row_data)
-
-        reply_message = f"登記成功！您的序號是：{new_serial}"
-        await messaging_api.reply_message(ReplyMessageRequest(
-            reply_token=event.reply_token,
-            messages=[V3TextMessage(text=reply_message)]
-        ))
-
-        # 發送郵件通知 (執行阻塞 I/O 操作於獨立線程)
-        await asyncio.to_thread(
-            send_notification_email,
-            f"新的登記訊息 - 序號 {new_serial}",
-            f"用戶 {user_name} (ID: {event.source.user_id}) 於 {timestamp_str} 登記，序號為 {new_serial}。\n詳細資料請參考 Google Sheet。"
+        # 3. 關鍵步驟：回覆使用者確認訊息
+        reply_text = f"您好 {user_name}，您的登記已完成。\n序號：{new_serial}\n時間：{timestamp_str}"
+        await messaging_api.reply_message(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=reply_text)]
+            )
         )
+
+        # 4. 非關鍵步驟：發送通知郵件。此操作的失敗不應影響給使用者的回覆。
+        try:
+            await send_notification_email(
+                subject=f"新的登記訊息 - 序號 {new_serial}",
+                body=f"用戶 {user_name} (ID: {user_id}) 於 {timestamp_str} 登記，序號為 {new_serial}。"
+            )
+            logger.info(f"已為序號 {new_serial} 發送通知郵件")
+        except Exception as email_error:
+            # 如果郵件發送失敗，只需記錄，因為主要流程已成功
+            logger.error(f"為序號 {new_serial} 發送通知郵件失敗: {email_error}", exc_info=True)
+
+    except GSheetApiClientError as e:
+        logger.error(f"為使用者 {user_id} 登記時發生 GSheet API 錯誤: {e}", exc_info=True)
+        await _reply_with_error(messaging_api, event, "抱歉，系統暫時無法連接到資料庫，請稍後再試。")
+    except LineBotApiError as e:
+        # 處理回覆訊息時的 API 錯誤
+        logger.error(f"回覆訊息給使用者 {user_id} 時發生 LINE API 錯誤: {e.status_code} {e.error.message}", exc_info=True)
+        # 此時已無法回覆，只能記錄
     except Exception as e:
-        logger.error(f"Registration failed for user {event.source.user_id}: {e}", exc_info=True)
-        await messaging_api.reply_message(ReplyMessageRequest(
-            reply_token=event.reply_token,
-            messages=[V3TextMessage(text=f"登記失敗，請稍後再試。")]
-        ))
+        logger.error(f"為使用者 {user_id} 登記時發生未預期的錯誤: {e}", exc_info=True)
+        await _reply_with_error(messaging_api, event, "抱歉，系統發生未預期的錯誤，我們將盡快處理，請聯繫管理員。")
 
-@command_with_argument(usage_message="請輸入要查詢的序號，例如：/查詢 123")
-async def query_command(serial_to_query: str, event: MessageEvent, messaging_api: MessagingApi):
-    # The core logic for querying, now much cleaner.
-    record = await asyncio.to_thread(gsheet_connector.find_row_by_serial, serial_to_query)
+# --- 主訊息路由器 ---
 
-    if record:
-        # 假設回傳的 record 是包含標題的字典
-        # 例如: {'序號': '123', '登記時間': '...', '處理狀態': '待處理'}
-        reply_text = f"查詢結果 - 序號 {serial_to_query}:\n"
-        reply_text += f"登記時間: {record.get('登記時間', 'N/A')}\n"
-        reply_text += f"登記用戶: {record.get('登記用戶', 'N/A')}\n"
-        reply_text += f"處理狀態: {record.get('處理狀態', 'N/A')}"
+async def handle_message(event: MessageEvent, messaging_api: MessagingApi):
+    """
+    將收到的文字訊息路由到對應的命令處理函式。
+    """
+    if not isinstance(event.message, TextMessageContent):
+        return  # 只處理文字訊息
+
+    text = event.message.text.strip().lower()
+
+    # 根據訊息文字進行簡單的路由
+    if text == "登記":
+        await handle_register_command(event, messaging_api)
     else:
-        reply_text = f"找不到序號 {serial_to_query} 的登記紀錄。"
-
-    await messaging_api.reply_message(ReplyMessageRequest(
-        reply_token=event.reply_token,
-        messages=[V3TextMessage(text=reply_text)]
-    ))
-
-@command_with_argument(usage_message="請輸入要取消的序號，例如：/取消 123")
-async def cancel_command(serial_to_cancel: str, event: MessageEvent, messaging_api: MessagingApi):
-    # The core logic for cancellation.
-    success = await asyncio.to_thread(gsheet_connector.update_status_by_serial, serial_to_cancel, "已取消")
-
-    if success:
-        reply_text = f"序號 {serial_to_cancel} 已成功標記為「已取消」。"
-    else:
-        reply_text = f"找不到序號 {serial_to_cancel} 或無法更新狀態。"
-
-    await messaging_api.reply_message(ReplyMessageRequest(
-        reply_token=event.reply_token,
-        messages=[V3TextMessage(text=reply_text)]
-    ))
-
-async def default_message_handler(event: MessageEvent, messaging_api: MessagingApi):
-    # 處理不屬於任何指令的普通訊息
-    await messaging_api.reply_message(ReplyMessageRequest(
-        reply_token=event.reply_token,
-        messages=[V3TextMessage(text="我收到你的訊息了！你可以嘗試輸入 /登記 或 /查詢。")]
-    ))
+        # 對於其他訊息的預設回覆
+        reply_text = f"您說了「{event.message.text}」。\n若要登記，請輸入「登記」。"
+        await messaging_api.reply_message(
+            ReplyMessageRequest(reply_token=event.reply_token, messages=[TextMessage(text=reply_text)])
+        )

@@ -4,4 +4,6 @@ python-dotenv==1.0.1
 pydantic-settings==2.3.4
 line-bot-sdk==3.17.1
 gspread==6.1.0
+gspread-asyncio==1.9.0
 oauth2client==4.1.2
+aiosmtplib==3.0.2
