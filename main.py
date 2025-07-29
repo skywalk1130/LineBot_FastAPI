@@ -4,21 +4,26 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 
 from routers import line_webhook, commands
-from utils.gsheet_connector import GSheetConnector
+# 導入非同步連接器以進行啟動檢查
+from utils.async_gsheet_connector import AsyncGSheetConnector
+from utils.logger import setup_logging
 from config import settings
-from utils.logger import setup_logger
 
-logger = setup_logger()
+# 在應用程式啟動的最開始就設定日誌系統
+setup_logging()
+
+logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 應用程式啟動時執行的程式碼
     logger.info("--- Application startup ---")
     try:
-        # 初始化並檢查 Google Sheets 連線
-        logger.info("Checking Google Sheets connection...")
-        gsheet_connector = GSheetConnector()
-        gsheet_connector.check_connection()
+        # 初始化非同步 Google Sheets 連接器並預熱快取
+        logger.info("Initializing and warming up async Google Sheets connection...")
+        gsheet_connector = AsyncGSheetConnector()
+        await gsheet_connector.get_worksheet()  # 透過獲取工作表來驗證連線並預熱快取
+        logger.info("Async Google Sheets connection verified and cache warmed up.")
     except Exception as e:
         # 如果啟動時發生嚴重錯誤，可以選擇在這裡處理或讓應用程式停止
         logger.critical(f"FATAL: Startup check failed. {e}", exc_info=True)
@@ -39,4 +44,5 @@ app.include_router(commands.router, prefix="/commands", tags=["Admin Commands"])
 
 if __name__ == "__main__":
     # 使用 uvicorn 啟動應用程式
-    uvicorn.run("main:app", host="0.0.0.0", port=settings.PORT, reload=True)
+    # log_config=None 確保 uvicorn 使用我們透過 setup_logging() 設定的 root logger
+    uvicorn.run("main:app", host="0.0.0.0", port=settings.PORT, reload=True, log_config=None)
