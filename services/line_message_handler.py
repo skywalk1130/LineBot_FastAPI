@@ -16,7 +16,6 @@ from utils.async_gsheet_connector import AsyncGSheetConnector, GSheetApiClientEr
 
 # --- 設定 ---
 logger = logging.getLogger(__name__)
-gsheet_connector = AsyncGSheetConnector()
 TAIWAN_TZ = timezone(timedelta(hours=+8))  # 設定時區為台灣時間
 
 
@@ -35,7 +34,7 @@ async def _reply_with_error(messaging_api: MessagingApi, event: MessageEvent, te
             f"無法發送錯誤訊息給使用者 {event.source.user_id}: {e.status_code} {e.error.message}"
         )
 
-async def handle_register_command(event: MessageEvent, messaging_api: MessagingApi):
+async def handle_register_command(event: MessageEvent, messaging_api: MessagingApi, gsheet_connector: AsyncGSheetConnector):
     """處理使用者的登記邏輯。"""
     user_id = event.source.user_id
     if not user_id:
@@ -93,7 +92,7 @@ async def handle_register_command(event: MessageEvent, messaging_api: MessagingA
 
 # --- 主訊息路由器 ---
 
-async def handle_message(event: MessageEvent, messaging_api: MessagingApi):
+async def handle_message(event: MessageEvent, messaging_api: MessagingApi, gsheet_connector: AsyncGSheetConnector):
     """
     將收到的文字訊息路由到對應的命令處理函式。
     """
@@ -104,7 +103,7 @@ async def handle_message(event: MessageEvent, messaging_api: MessagingApi):
 
     # 根據訊息文字進行簡單的路由
     if text == "登記":
-        await handle_register_command(event, messaging_api)
+        await handle_register_command(event, messaging_api, gsheet_connector)
     else:
         # 對於其他訊息的預設回覆
         reply_text = f"您說了「{event.message.text}」。\n若要登記，請輸入「登記」。"
