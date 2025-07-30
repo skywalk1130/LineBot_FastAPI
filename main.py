@@ -5,10 +5,10 @@ from fastapi import FastAPI, HTTPException
 from contextlib import asynccontextmanager
 
 from routers import line_webhook, commands
-# 導入非同步連接器以進行啟動檢查
-from utils.async_gsheet_connector import AsyncGSheetConnector
+# 導入正確的連接器
+from utils.async_gsheet_connector import get_gsheet_connector, GSheetApiClientError
 from utils.logger import setup_logging
-# 導入更新的 LINE API 客戶端管理器
+# 導入 LINE API 客戶端管理器
 from utils.line_api_client import close_line_api, line_api_health_check, get_line_api_metrics
 from config import settings
 
@@ -29,17 +29,21 @@ async def lifespan(app: FastAPI):
     }
     
     try:
-        # 1. 初始化非同步 Google Sheets 連接器並預熱快取
-        logger.info("Initializing and warming up async Google Sheets connection...")
+        # 1. 初始化並預熱 Google Sheets 連接
+        logger.info("Initializing and warming up Google Sheets connection...")
         try:
-            gsheet_connector = AsyncGSheetConnector()
+            gsheet_connector = await get_gsheet_connector()
             await gsheet_connector.get_worksheet()  # 驗證連線並預熱快取
             startup_checks['google_sheets']['status'] = 'healthy'
             logger.info("✓ Google Sheets connection verified and cache warmed up.")
+        except GSheetApiClientError as e:
+            startup_checks['google_sheets']['status'] = 'unhealthy'
+            startup_checks['google_sheets']['error'] = str(e)
+            logger.error(f"✗ Google Sheets initialization failed: {e}")
         except Exception as e:
             startup_checks['google_sheets']['status'] = 'unhealthy'
             startup_checks['google_sheets']['error'] = str(e)
-            logger.error(f"✗ Google Sheets initialization failed: {e}", exc_info=True)
+            logger.error(f"✗ Unexpected error in Google Sheets initialization: {e}", exc_info=True)
         
         # 2. 檢查 LINE API 客戶端健康狀態
         logger.info("Checking LINE API client health...")
@@ -172,9 +176,14 @@ async def detailed_health_check():
     
     # 3. 實時 Google Sheets 檢查
     try:
-        gsheet_connector = AsyncGSheetConnector()
+        gsheet_connector = await get_gsheet_connector()
         await gsheet_connector.get_worksheet()
         checks["google_sheets_realtime"] = {"status": "healthy"}
+    except GSheetApiClientError as e:
+        checks["google_sheets_realtime"] = {
+            "status": "unhealthy",
+            "error": str(e)
+        }
     except Exception as e:
         checks["google_sheets_realtime"] = {
             "status": "unhealthy",
